@@ -824,11 +824,11 @@ class OverlayWindow(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         if self.slingshot.aiming:
-            # 瞄准中：光标不许离开当前屏，否则和跨屏拖动抢同一下移动。
-            # 拉拽矢量用钳回后的位置；sprite 定锚不动（不走 on_move）。
+            # 瞄准中：move 只更新拉拽矢量，sprite 定锚不动（不走 on_move）。
+            # 跨屏在 ``_maybe_cross_screen`` 里已经因 aiming 直接拒绝。
+            # 橡皮带末端跟事件里的光标，不把光标钳回屏幕边缘。
             self._note_kinetic()  # M-1：瞄准移动保持 T0
-            clamped = self._clamp_cursor_to_screen(event.globalPosition().toPoint())
-            self.slingshot.update_pull(self.mapFromGlobal(clamped))
+            self.slingshot.update_pull(event.position())
             self._refresh_slingshot_visual()
             event.accept()
             return
@@ -854,8 +854,7 @@ class OverlayWindow(QWidget):
         self._note_kinetic()  # M-1：松手（甩出判定）同步升档
         if self.slingshot.aiming:
             if event.button() == Qt.MouseButton.LeftButton:
-                clamped = self._clamp_cursor_to_screen(event.globalPosition().toPoint())
-                self._fire_slingshot(self.mapFromGlobal(clamped))
+                self._fire_slingshot(event.position())
                 event.accept()
                 return
             # 右键/其它键松手：瞄准继续（左键仍按住）。右键的取消手势在
@@ -992,11 +991,7 @@ class OverlayWindow(QWidget):
             return
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
             if self.slingshot.aiming:
-                # 光标已经离开窗口时 move 事件会停；轮询把光标拉回当前屏，
-                # 跨屏拖动在瞄准期间不接手。
-                clamped = self._clamp_cursor_to_screen(QCursor.pos())
-                self.slingshot.update_pull(self.mapFromGlobal(clamped))
-                self._refresh_slingshot_visual()
+                # 瞄准期间不跨屏，也不改拉拽矢量：橡皮带末端仍是上次移动事件的光标。
                 return
             # 按住拖出当前屏后，Qt 可能不再把 move 送到这块窗外；tick / 穿透轮询
             # 仍会进这里，用全局光标补一次跨屏判定。
@@ -1016,13 +1011,8 @@ class OverlayWindow(QWidget):
         点击/拖拽判别状态（``ShellOverlayWindow._press_pos``：右键 press
         会覆写它，若不清理，随后的左键松手会被壳层判成一次单击）。
         """
-        cursor = event.position()
-        if self.slingshot.aiming or (
-                self.slingshot.enabled and self._mouse_grab is not None):
-            # 进入/保持弹射拉拽：先把光标留在当前屏，再记拉拽起点。
-            cursor = self.mapFromGlobal(
-                self._clamp_cursor_to_screen(event.globalPosition().toPoint()))
-        if not self.slingshot.maybe_enter_on_right_press(self._mouse_grab, cursor):
+        if not self.slingshot.maybe_enter_on_right_press(
+                self._mouse_grab, event.position()):
             return False
         self._context_menu_suppressed = True
         self._invalidate_press_discriminator()

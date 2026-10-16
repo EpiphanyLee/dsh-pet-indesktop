@@ -15,8 +15,7 @@
 
 - 改了什么
   - `pet/overlay_shell.py`：启动时若调用方没有指定屏幕，按 slot0 档案里的 `screen_name` 选屏。拖动跨屏时不重建窗口、不结束抓取；先把被拖的宠物从旧画面擦掉，合成窗铺满目标屏后再钉到新屏光标下并清掉弹簧速度。其它宠物按原比例跟着这张窗走。已经在飞，或拖动物理开着且末段速度达到甩出死区，则不搬窗。短于 20ms 的快甩若被初速估算当成 0，改用这段位移补算速度。
-  - `pet/overlay_window.py`（+55 / −9）：真拖拽的鼠标移动先问壳要不要跨屏，成功就不再用旧窗的局部坐标跟手。弹射瞄准期间把光标钳回当前屏，移动只更新拉拽，松左键前也先钳再发射。卡住检测在瞄准时同样只钳光标，不跨屏。
-  - `pet/window.py`（+15）：捕获窗进入弹射拉动和更新瞄准时，把系统光标留在宠物当前所在的那块屏上。
+  - `pet/overlay_window.py`：真拖拽的鼠标移动先问壳要不要跨屏，成功就不再用旧窗的局部坐标跟手。弹射瞄准不跨屏，拉拽和发射仍用事件里的光标位置。卡住检测在瞄准时直接返回，不改拉拽矢量。
 - 新增了什么
   - `pet/window_screen_cross.py`：纯几何判定。屏幕矩形左闭右开，接缝算给起点在那边的屏；光标落在屏缝里时取更近的另一块屏。另有启动屏解析、局部坐标、甩出死区判定、短窗快甩补速 `short_flick_speed`，以及把光标钳进当前屏的 `hold_cursor_on_screen`。
   - `tests/test_window_screen_cross.py`：几何判定、慢拖搬家、快拖留在当前屏、停住后再在 20ms 内甩出仍留在当前屏、已飞出的弹射不搬窗、弹射瞄准不跨屏、跨屏后宠物当帧落在指针下且弹簧速度为 0。
@@ -34,19 +33,19 @@
 2. 壳看这下移动算不算甩出。`interaction_state == "thrown"`，或者 `drag_physics` 为真且速度不低于 `DEAD_ZONE_SPEED`（500 px/s），就留在当前屏。速度先取 `estimate_release_velocity`。它把短于 20ms（`MIN_SPAN_SEC`）的窗口当成无法估计并返回 0；这时若最近 0.12 秒（`RELEASE_WINDOW_SEC`）里的样本短于 20ms、位移却达到 20 像素，改用这段位移除以时长。更早的停留不计入，避免把快甩拉成慢拖。低于死区才搬家。拖动物理关着时没有甩出，快拖也搬家。
 3. 搬家时先 `set_visible(False)` 把被拖的宠物从旧画面擦掉并 `repaint`，再 `setScreen` / `setGeometry` 把合成窗铺满目标屏。Windows 上几何对不齐时用 `SetWindowPos` 按屏幕矩形铺满。窗到位后用新原点把光标换成局部坐标，`set_pos` 钉到指针下，弹簧速度和弹簧活动标记清零，再显示并 `repaint`。这样不会先按新屏坐标画在旧窗的另一边。旧屏上的拖动轨迹丢掉，避免换原点之后被估成一次甩出。之后的 `on_move` 仍按 `drag_physics` 写弹簧目标，弹簧恢复跟手。失败时把藏起的宠物重新显示。
 
-弹射拉动不搬窗。合成窗在瞄准的移动、轮询和松手发射前把光标钳到当前屏最后一个像素；捕获窗走同一个 `hold_cursor_on_screen`。
+弹射拉动不搬窗。瞄准期间跨屏判定直接拒绝，拉拽矢量仍用事件里的光标位置，橡皮带末端跟着真实光标，不把光标钳回屏幕边缘。
 
 ## 影响范围
 
-- 模块：`pet/overlay_shell.py`、`pet/overlay_window.py`、`pet/window.py`、新增 `pet/window_screen_cross.py`。拖动弹簧、甩出初速、弹射瞄准的原有公式没有改。
+- 模块：`pet/overlay_shell.py`、`pet/overlay_window.py`、新增 `pet/window_screen_cross.py`。拖动弹簧、甩出初速、弹射瞄准的原有公式没有改。捕获窗 `pet/window.py` 没有改。
 - 页面：没有改设置页，没有新配置键。启动仍读已有的 slot0 `screen_name`。
-- 行为：同一张合成窗上的其它宠物会按比例迁到新屏，因为一张窗盖不住两块屏。气泡跟随用原来的原点同步。捕获窗的普通拖拽/抛掷边界仍走 `pet/window_placement.py`，这次只加了弹射拉动时的光标钳制。
+- 行为：同一张合成窗上的其它宠物会按比例迁到新屏，因为一张窗盖不住两块屏。气泡跟随用原来的原点同步。捕获窗的拖拽、抛掷和弹射拉动仍走原来的 `pet/window.py` 与 `pet/window_placement.py`。
 - 接口 / 数据库：无。位置仍写在 `%APPDATA%\dsh-pet-standalone\config-slot-N.json` 的 `rx` / `ry` / `screen_name`。
 
 ## 测试情况
 
 - 本地测试：调试时确认过三件事。快速拖到另一块屏会甩出，不能当成搬家。慢慢拖才搬窗。跨屏后宠物会先出现在新屏另一边再被弹簧拉回指针；落点已改成先钉到指针再挪窗。
-- 单元测试：`tests/test_window_screen_cross.py` 于 2026-10-16 在本机 `.venv`（Python 3.11，`QT_QPA_PLATFORM=offscreen`）跑过，**21 passed**。覆盖接缝/屏缝、慢拖搬家、快拖不搬、停住后再在 20ms 内甩出仍不搬、已飞出不搬、瞄准不跨屏、跨屏当帧落在指针下且弹簧速度为 0。复跑：
+- 单元测试：`tests/test_window_screen_cross.py` 于 2026-10-16 在本机 `.venv`（Python 3.11，`QT_QPA_PLATFORM=offscreen`）跑过，**22 passed**。覆盖接缝/屏缝、假屏不在系统屏幕列表里时不误跨、慢拖搬家、快拖不搬、停住后再在 20ms 内甩出仍不搬、已飞出不搬、瞄准不跨屏、跨屏当帧落在指针下且弹簧速度为 0。复跑：
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
@@ -76,11 +75,11 @@ git revert <本次提交>
 若改动还在工作区、尚未提交：
 
 ```powershell
-git checkout -- pet/overlay_shell.py pet/overlay_window.py pet/window.py docs/INDEX.md
+git checkout -- pet/overlay_shell.py pet/overlay_window.py docs/INDEX.md
 Remove-Item pet/window_screen_cross.py, tests/test_window_screen_cross.py, docs/cross_screen.md
 ```
 
-回退后 overlay 恢复为单屏合成窗，捕获窗的弹射拉动不再钳光标。`screen_name` 的读写本来就有，档案不用迁移。
+回退后 overlay 恢复为单屏合成窗。`screen_name` 的读写本来就有，档案不用迁移。
 
 ## 关联链接
 

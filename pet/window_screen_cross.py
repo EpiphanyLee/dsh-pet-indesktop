@@ -174,6 +174,17 @@ def other_screen_at(global_pos, current, screens):
         if same_screen(screen, current):
             current_index = index
             break
+    # 测试壳会把合成窗铺在一张不在 ``QApplication.screens()`` 里的假屏上。
+    # 光标还在这张屏里时不能因为「离某块真屏更近」就把窗搬走。
+    if current_index is None and current is not None:
+        try:
+            geo = current.geometry()
+            geometries.append((geo.x(), geo.y(), geo.width(), geo.height()))
+        except Exception:
+            geo = None
+        else:
+            usable.append(current)
+            current_index = len(usable) - 1
     index = screen_index_at(global_pos.x(), global_pos.y(), geometries,
                             current=current_index)
     if index is None:

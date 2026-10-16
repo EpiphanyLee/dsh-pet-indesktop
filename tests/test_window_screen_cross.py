@@ -75,6 +75,15 @@ def test_startup_uses_saved_screen_when_it_is_still_connected():
     assert resolve_startup_screen(primary, [primary, other], "") is primary
 
 
+def test_cursor_on_an_unlisted_current_screen_does_not_cross():
+    """合成窗铺在不在 screens() 里的假屏上时，光标还在这张屏里就不能搬走。"""
+    current = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040), name="FAKE")
+    overlapped = FakeScreen((0, 0, 800, 800), (0, 0, 800, 800), name="OFFSCREEN")
+    beside = FakeScreen((2000, 0, 800, 800), (2000, 0, 800, 800), name="BESIDE")
+    assert other_screen_at(QPoint(1654, 908), current, [overlapped]) is None
+    assert other_screen_at(QPoint(2100, 100), current, [beside]) is beside
+
+
 def test_other_screen_at_ignores_the_screen_under_the_cursor_when_it_is_current():
     primary = FakeScreen(PRIMARY, PRIMARY, name="DISPLAY1")
     other = FakeScreen(SECONDARY, SECONDARY, name="DISPLAY2")
