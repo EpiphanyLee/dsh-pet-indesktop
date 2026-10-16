@@ -5847,7 +5847,7 @@ class OverlayShell(QObject):
         import math
 
         from . import physics as physics_mod
-        from .window_screen_cross import throw_stays_on_screen
+        from .window_screen_cross import short_flick_speed, throw_stays_on_screen
 
         if getattr(grab, "interaction_state", None) == "thrown":
             return True
@@ -5858,8 +5858,17 @@ class OverlayShell(QObject):
         now = clock() if callable(clock) else time.monotonic()
         cap = getattr(grab, "throw_speed_cap", physics_mod.MAX_THROW_SPEED)
         vx, vy = physics_mod.estimate_release_velocity(trail, now, cap=cap)
+        speed = math.hypot(vx, vy)
+        # 快甩常常挤在 20ms 里。估算函数把这么短的窗口当成无法估计，返回 0。
+        # 只补最近这一截：整段轨迹里还有更早的停留，用整段时长仍会算成慢拖。
+        if speed < physics_mod.DEAD_ZONE_SPEED:
+            flicked = short_flick_speed(
+                trail, now, physics_mod.RELEASE_WINDOW_SEC,
+                physics_mod.MIN_SPAN_SEC, 20.0)
+            if flicked is not None:
+                speed = flicked
         return throw_stays_on_screen(
-            True, math.hypot(vx, vy), physics_mod.DEAD_ZONE_SPEED)
+            True, speed, physics_mod.DEAD_ZONE_SPEED)
 
     def _fit_overlay_to_screen(self, overlay, screen) -> QPoint:
         """把合成窗铺成这块屏的完整几何，返回该屏原点。
@@ -5943,20 +5952,20 @@ class OverlayShell(QObject):
             return False
         self._cross_busy = True
         old_screen = self._screen
+        hidden = False
+        set_visible = getattr(grab, "set_visible", None)
         try:
             old_bounds = QRect(self._bounds)
             old_origin = overlay.geometry().topLeft()
-            # 先钉到新屏光标下再挪窗。窗先过去时，旧局部坐标会画在新屏另一边，
-            # 拖动弹簧再把宠物拉回指针。
             new_bounds = self._local_bounds(new_screen)
-            screen_origin = new_screen.geometry().topLeft()
-            local_x, local_y = local_point(
-                global_cursor.x(), global_cursor.y(),
-                screen_origin.x(), screen_origin.y())
-            self._snap_grab_under_cursor(grab, local_x, local_y, new_bounds)
-            repaint = getattr(overlay, "repaint", None)
-            if callable(repaint):
-                repaint()
+            # 先把被拖的那只从旧画面擦掉再挪窗。若先按新屏坐标画在旧窗上，
+            # 宠物会闪到这块屏的另一边，窗过去之后再被拉回指针。
+            if callable(set_visible) and bool(getattr(grab, "visible", True)):
+                set_visible(False)
+                hidden = True
+                repaint = getattr(overlay, "repaint", None)
+                if callable(repaint):
+                    repaint()
             self._disconnect_screen(old_screen)
             self._screen = new_screen
             overlay._screen = new_screen
@@ -5982,10 +5991,12 @@ class OverlayShell(QObject):
             self._sync_bubble_origin(old_origin)
             local_x, local_y = local_point(
                 global_cursor.x(), global_cursor.y(), origin.x(), origin.y())
-            if (local_x, local_y) != (
-                    global_cursor.x() - screen_origin.x(),
-                    global_cursor.y() - screen_origin.y()):
-                self._snap_grab_under_cursor(grab, local_x, local_y, new_bounds)
+            self._snap_grab_under_cursor(grab, local_x, local_y, new_bounds)
+            if hidden and callable(set_visible):
+                set_visible(True)
+            repaint = getattr(overlay, "repaint", None)
+            if callable(repaint):
+                repaint()
             # 旧屏轨迹用的是旧原点。接上新屏坐标会被估成一次甩出，松手就弹射。
             # 跨屏只留新位置这一个样本，之后在新屏上的快甩仍能重新攒速度。
             if hasattr(grab, "_drag_trail"):
@@ -6001,6 +6012,11 @@ class OverlayShell(QObject):
             return True
         except Exception:
             logging.exception("overlay: 拖动跨屏失败")
+            if hidden and callable(set_visible):
+                try:
+                    set_visible(True)
+                except Exception:
+                    logging.debug("overlay: 跨屏失败后恢复可见失败", exc_info=True)
             if self._screen is new_screen:
                 self._connect_screen(new_screen)
             else:

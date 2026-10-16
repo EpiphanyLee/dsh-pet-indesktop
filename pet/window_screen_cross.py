@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 
@@ -99,6 +100,31 @@ def hold_cursor_on_screen(global_pos, geometry, cursor_setter=None):
         setter = cursor_setter or QCursor.setPos
         setter(clamped)
     return clamped
+
+
+def short_flick_speed(trail, now: float, window_sec: float, min_span: float,
+                      min_distance: float) -> float | None:
+    """最近 ``window_sec`` 里的样本若短于 ``min_span``、位移却达到 ``min_distance``，返回这段速度。
+
+    松手初速估算会把短于 ``min_span`` 的窗口当成无法估计并返回 0。快甩前的停留
+    还留在整段轨迹里，用整段时长会把这次快甩算成慢拖。这里只看估算用的那一截。
+    没有这种短窗口时返回 None。
+    """
+    if len(trail) < 2:
+        return None
+    cutoff = float(now) - float(window_sec)
+    window = [sample for sample in trail if sample[0] >= cutoff]
+    if len(window) < 2:
+        return None
+    t0, x0, y0 = window[0]
+    t1, x1, y1 = window[-1]
+    dt = float(t1) - float(t0)
+    if not (0.0 < dt < float(min_span)):
+        return None
+    dist = math.hypot(float(x1) - float(x0), float(y1) - float(y0))
+    if dist < float(min_distance):
+        return None
+    return dist / dt
 
 
 def throw_stays_on_screen(drag_physics: bool, speed: float, dead_zone: float) -> bool:

@@ -19,6 +19,7 @@ from pet.window_screen_cross import (
     resolve_startup_screen,
     screen_by_name,
     screen_index_at,
+    short_flick_speed,
     throw_stays_on_screen,
 )
 from tests.test_overlay_screen_migration import FakeScreen, _make_shell, _teardown
@@ -116,6 +117,48 @@ def test_throw_speed_stays_on_the_current_screen():
     assert throw_stays_on_screen(True, physics_mod.DEAD_ZONE_SPEED, physics_mod.DEAD_ZONE_SPEED)
     assert throw_stays_on_screen(True, physics_mod.DEAD_ZONE_SPEED - 1, physics_mod.DEAD_ZONE_SPEED) is False
     assert throw_stays_on_screen(False, 9000, physics_mod.DEAD_ZONE_SPEED) is False
+
+
+def test_short_flick_ignores_the_hold_before_it():
+    """停住后再在 20ms 内甩出：更早的停留不把这次快甩拉成慢拖。"""
+    now = 10.0
+    trail = [
+        (now - 0.14, 100.0, 400.0),
+        (now - 0.008, 100.0, 400.0),
+        (now, 700.0, 400.0),
+    ]
+    speed = short_flick_speed(trail, now, physics_mod.RELEASE_WINDOW_SEC,
+                              physics_mod.MIN_SPAN_SEC, 20.0)
+    assert speed is not None and speed >= physics_mod.DEAD_ZONE_SPEED
+    slow = [(now - 0.10, 400.0, 400.0), (now, 408.0, 400.0)]
+    assert short_flick_speed(slow, now, physics_mod.RELEASE_WINDOW_SEC,
+                             physics_mod.MIN_SPAN_SEC, 20.0) is None
+
+
+def test_flick_after_a_hold_does_not_move_the_overlay(tmp_path):
+    """停住后 20ms 内甩过边界：初速估算返回 0，合成窗仍然留在当前屏。"""
+    primary = FakeScreen(PRIMARY, (0, 0, 1920, 1040), name="DISPLAY1")
+    other = FakeScreen(SECONDARY, (1920, 0, 1920, 1040), name="DISPLAY2")
+    shell = _make_shell(tmp_path, primary)
+    try:
+        sprite = shell.sprite
+        sprite._dragging = True
+        sprite.drag_physics = True
+        sprite._drag_offset = QPointF(10, 20)
+        now = sprite._clock()
+        sprite._drag_trail = [
+            (now - 0.14, 100.0, 400.0),
+            (now - 0.008, 100.0, 400.0),
+            (now, 700.0, 400.0),
+        ]
+        shell.overlay._mouse_grab = sprite
+        shell.overlay._drag_committed = True
+
+        assert shell._on_cross_screen_drag(QPoint(2500, 400), screens=[primary, other]) is False
+        assert shell._screen is primary
+        assert shell.overlay.geometry() == primary.geometry()
+    finally:
+        _teardown(shell)
 
 
 def test_fast_drag_toward_another_screen_stays_and_counts_as_throw(tmp_path):
