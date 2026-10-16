@@ -83,7 +83,8 @@ class OverlayWindow(QWidget):
         # legacy ``PetWindow`` 一直带着这条修复（pet/window.py，同一 helper），overlay
         # 单合成窗新架构落成时漏了它。只设 native 属性、不动 flags，不会重建原生窗口。
         _keep_macos_tool_window_visible(self)
-        # Phase 1a 暂不做多屏：默认主屏，调用方可注入别的 QScreen。
+        # 窗口一次只铺当前这一块屏。拖到另一块屏时由壳上的
+        # ``_cross_screen_drag`` 把整窗搬过去（pet/window_screen_cross.py）。
         self._screen = screen or QApplication.primaryScreen()
         self.setGeometry(self._screen.geometry())
 
@@ -823,9 +824,11 @@ class OverlayWindow(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         if self.slingshot.aiming:
-            # 瞄准中：move 只更新拉拽矢量，sprite 定锚不动（不走 on_move）
+            # 瞄准中：光标不许离开当前屏，否则和跨屏拖动抢同一下移动。
+            # 拉拽矢量用钳回后的位置；sprite 定锚不动（不走 on_move）。
             self._note_kinetic()  # M-1：瞄准移动保持 T0
-            self.slingshot.update_pull(event.position())
+            clamped = self._clamp_cursor_to_screen(event.globalPosition().toPoint())
+            self.slingshot.update_pull(self.mapFromGlobal(clamped))
             self._refresh_slingshot_visual()
             event.accept()
             return
@@ -839,16 +842,20 @@ class OverlayWindow(QWidget):
             return
         self._note_kinetic()  # M-1：拖拽移动保持 T0
         # 先判升级再喂移动：on_move 在 begin_drag 之前是 no-op（点击候选不挪窝）
-        self._commit_drag_if_threshold_crossed(event.globalPosition().toPoint())
-        # grab 期间事件直达被按住的 sprite（光标移出/落到别的 sprite 上不换手）
-        self._mouse_grab.on_move(event.position())
+        global_pos = event.globalPosition().toPoint()
+        self._commit_drag_if_threshold_crossed(global_pos)
+        # 先跨屏再跟手：这次事件的局部坐标还是旧窗的，跨屏成功后壳已经按新屏
+        # 原点放过位置，再用旧局部坐标 on_move 会把宠物钳回边缘卡住。
+        if not self._maybe_cross_screen(global_pos):
+            self._mouse_grab.on_move(event.position())
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
         self._note_kinetic()  # M-1：松手（甩出判定）同步升档
         if self.slingshot.aiming:
             if event.button() == Qt.MouseButton.LeftButton:
-                self._fire_slingshot(event.position())
+                clamped = self._clamp_cursor_to_screen(event.globalPosition().toPoint())
+                self._fire_slingshot(self.mapFromGlobal(clamped))
                 event.accept()
                 return
             # 右键/其它键松手：瞄准继续（左键仍按住）。右键的取消手势在
@@ -930,6 +937,30 @@ class OverlayWindow(QWidget):
         if callable(cb):
             cb()
 
+    def _clamp_cursor_to_screen(self, global_pos) -> QPoint:
+        """弹射拉拽期间把全局光标留在当前合成窗这块屏内。已在屏内则不动鼠标。"""
+        from .window_screen_cross import clamp_point_inside
+
+        screen = self._screen
+        geo = screen.geometry() if screen is not None else self.geometry()
+        x, y = clamp_point_inside(
+            global_pos.x(), global_pos.y(),
+            geo.x(), geo.y(), geo.width(), geo.height())
+        clamped = QPoint(int(round(x)), int(round(y)))
+        if clamped != QPoint(global_pos):
+            setter = getattr(self, "_cursor_pos_setter", None) or QCursor.setPos
+            setter(clamped)
+        return clamped
+
+    def _maybe_cross_screen(self, global_pos) -> bool:
+        """真拖拽中把全局光标交给壳。返回是否已经把整窗铺到光标所在的那块屏。"""
+        if not self._drag_committed or self.slingshot.aiming or self._press_click_only:
+            return False
+        callback = getattr(self, "_cross_screen_drag", None)
+        if not callable(callback):
+            return False
+        return bool(callback(global_pos))
+
     def _check_stale_press(self) -> None:
         """V-7 拖拽看门狗：release 事件丢失（alt-tab/弹窗抢 grab/屏拔除）
         时 _press_global 卡死 → should_click_through 永假 → 全屏吞点击。
@@ -960,6 +991,16 @@ class OverlayWindow(QWidget):
             self._finish_grab(QPointF(self.mapFromGlobal(QCursor.pos())))
             return
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            if self.slingshot.aiming:
+                # 光标已经离开窗口时 move 事件会停；轮询把光标拉回当前屏，
+                # 跨屏拖动在瞄准期间不接手。
+                clamped = self._clamp_cursor_to_screen(QCursor.pos())
+                self.slingshot.update_pull(self.mapFromGlobal(clamped))
+                self._refresh_slingshot_visual()
+                return
+            # 按住拖出当前屏后，Qt 可能不再把 move 送到这块窗外；tick / 穿透轮询
+            # 仍会进这里，用全局光标补一次跨屏判定。
+            self._maybe_cross_screen(QCursor.pos())
             return
         if self.slingshot.aiming and self._cancel_slingshot(resume_drag=False):
             # 瞄准会话的按压源（左键）已消失且 release 没到：收会话回锚点
@@ -975,8 +1016,13 @@ class OverlayWindow(QWidget):
         点击/拖拽判别状态（``ShellOverlayWindow._press_pos``：右键 press
         会覆写它，若不清理，随后的左键松手会被壳层判成一次单击）。
         """
-        if not self.slingshot.maybe_enter_on_right_press(
-                self._mouse_grab, event.position()):
+        cursor = event.position()
+        if self.slingshot.aiming or (
+                self.slingshot.enabled and self._mouse_grab is not None):
+            # 进入/保持弹射拉拽：先把光标留在当前屏，再记拉拽起点。
+            cursor = self.mapFromGlobal(
+                self._clamp_cursor_to_screen(event.globalPosition().toPoint()))
+        if not self.slingshot.maybe_enter_on_right_press(self._mouse_grab, cursor):
             return False
         self._context_menu_suppressed = True
         self._invalidate_press_discriminator()

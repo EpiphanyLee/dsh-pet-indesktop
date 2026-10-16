@@ -1015,6 +1015,14 @@ class OverlayShell(QObject):
         self.app = app
         self._instance = instance
         self._config = getattr(instance.config, "_main", instance.config)
+        if screen is None:
+            from .window_screen_cross import resolve_startup_screen, saved_screen_name
+
+            screen = resolve_startup_screen(
+                app.primaryScreen(),
+                list(app.screens() or ()),
+                saved_screen_name(getattr(self._config, "dir", None)),
+            )
         self._screen = screen if screen is not None else app.primaryScreen()
         self._sprite_factory = sprite_factory or (
             lambda lib, pos, scale: PetSprite(lib, pos=pos, scale=scale))
@@ -1220,6 +1228,7 @@ class OverlayShell(QObject):
         # 与真到达窗口的鼠标输入，同一入口、同一语义
         self.overlay._shown_cb = self._converge_auto_cursor_hidden
         self.overlay._user_input_cb = self._converge_auto_cursor_hidden
+        self.overlay._cross_screen_drag = self._on_cross_screen_drag
         if self.sprite is not None:
             self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
         self._last_marker_write = 0.0
@@ -5688,6 +5697,7 @@ class OverlayShell(QObject):
         # 迁移重建的新 overlay 同样要挂收敛钩子（与 __init__ 同口径、同一入口）
         self.overlay._shown_cb = self._converge_auto_cursor_hidden
         self.overlay._user_input_cb = self._converge_auto_cursor_hidden
+        self.overlay._cross_screen_drag = self._on_cross_screen_drag
         if self.sprite is not None:
             self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
         # 4.2b：子肥鱼随主 sprite 一起迁到新 overlay（否则拔屏/主屏切换后
@@ -5805,6 +5815,199 @@ class OverlayShell(QObject):
             except Exception:
                 subtitle = ""
         return text, subtitle, 3200
+
+    def _on_cross_screen_drag(self, global_pos, screens=None) -> bool:
+        """拖拽中光标进入另一块屏：整窗搬过去，被拖的那只留在光标下。
+
+        不重建 overlay、不结束 grab。其它宠物按原有比例迁到新屏（一张合成窗
+        盖不住两块屏，它们只能跟着这张窗走）。``screens`` 仅供测试注入假屏。
+        """
+        overlay = getattr(self, "overlay", None)
+        grab = getattr(overlay, "_mouse_grab", None) if overlay is not None else None
+        if overlay is None or grab is None or not overlay._drag_committed:
+            return False
+        if getattr(self, "_cross_busy", False):
+            return False
+        # 弹射拉拽进行中：光标被留在当前屏，这里再拒一次，避免和跨屏拖动叠在同一次移动上。
+        if getattr(getattr(overlay, "slingshot", None), "aiming", False):
+            return False
+        from .window_screen_cross import other_screen_at
+
+        if screens is None:
+            screens = list(self.app.screens() or ())
+        target = other_screen_at(global_pos, self._screen, screens)
+        if target is None:
+            return False
+        if self._throw_stays_on_screen(grab):
+            return False
+        return self._carry_drag_to_screen(target, global_pos, grab)
+
+    def _throw_stays_on_screen(self, grab) -> bool:
+        """快速拖动和已经飞起来的弹射留在当前屏。只有慢慢拖过边界才搬家。"""
+        import math
+
+        from . import physics as physics_mod
+        from .window_screen_cross import throw_stays_on_screen
+
+        if getattr(grab, "interaction_state", None) == "thrown":
+            return True
+        if not bool(getattr(grab, "drag_physics", False)):
+            return False
+        trail = list(getattr(grab, "drag_trail", ()) or ())
+        clock = getattr(grab, "_clock", None)
+        now = clock() if callable(clock) else time.monotonic()
+        cap = getattr(grab, "throw_speed_cap", physics_mod.MAX_THROW_SPEED)
+        vx, vy = physics_mod.estimate_release_velocity(trail, now, cap=cap)
+        return throw_stays_on_screen(
+            True, math.hypot(vx, vy), physics_mod.DEAD_ZONE_SPEED)
+
+    def _fit_overlay_to_screen(self, overlay, screen) -> QPoint:
+        """把合成窗铺成这块屏的完整几何，返回该屏原点。
+
+        光标在哪块屏，窗就必须整块在那块屏上：先 ``setScreen`` 再 ``setGeometry``。
+        仍对不齐时用 SetWindowPos 按屏幕矩形强制铺满，避免停在两屏接缝上。
+        """
+        geo = QRect(screen.geometry())
+        handle = overlay.windowHandle()
+        if handle is not None:
+            try:
+                handle.setScreen(screen)
+            except Exception:
+                logging.debug("overlay: setScreen 失败", exc_info=True)
+        overlay.setGeometry(geo)
+        if overlay.geometry() != geo:
+            self._force_overlay_rect(overlay, geo)
+            if overlay.geometry() != geo:
+                overlay.setGeometry(geo)
+        if overlay.geometry() != geo:
+            logging.warning("overlay: 合成窗未铺满目标屏，期望 %s，实际 %s",
+                            geo, overlay.geometry())
+        return geo.topLeft()
+
+    @staticmethod
+    def _force_overlay_rect(overlay, geo: QRect) -> None:
+        """Windows：按给定矩形重放窗口位置和大小，不激活、不改 z 序语义。"""
+        import sys
+
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = int(overlay.winId())
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            topmost = bool(overlay.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+            user32.SetWindowPos(
+                hwnd,
+                -1 if topmost else 0,
+                int(geo.x()), int(geo.y()), int(geo.width()), int(geo.height()),
+                0x0010 | 0x0040,  # SWP_NOACTIVATE | SWP_SHOWWINDOW
+            )
+        except Exception:
+            logging.debug("overlay: SetWindowPos 铺满目标屏失败", exc_info=True)
+
+    def _snap_grab_under_cursor(self, grab, local_x: float, local_y: float,
+                                bounds: QRect) -> None:
+        """被拖的宠物立刻落到新屏光标下，弹簧速度清零，避免从旧坐标拉过去。"""
+        set_bounds = getattr(grab, "set_bounds", None)
+        if callable(set_bounds):
+            set_bounds(QRect(bounds))
+        offset = getattr(grab, "_drag_offset", None)
+        target = (QPointF(grab.pos) if offset is None
+                  else QPointF(local_x, local_y) - QPointF(offset))
+        if hasattr(grab, "_drag_spring_vel"):
+            grab._drag_spring_vel = QPointF(0.0, 0.0)
+        if hasattr(grab, "_drag_spring_target"):
+            grab._drag_spring_target = QPointF(target)
+        if hasattr(grab, "_spring_active"):
+            grab._spring_active = False
+        set_pos = getattr(grab, "set_pos", None)
+        if callable(set_pos):
+            set_pos(target)
+
+    def _carry_drag_to_screen(self, new_screen, global_cursor, grab) -> bool:
+        """把当前合成窗的几何换成 ``new_screen``，并保持这次拖拽。"""
+        from .window_screen_cross import local_point, same_screen
+
+        if new_screen is None or same_screen(new_screen, self._screen):
+            return False
+        overlay = self.overlay
+        if overlay is None:
+            return False
+        self._cross_busy = True
+        old_screen = self._screen
+        try:
+            old_bounds = QRect(self._bounds)
+            old_origin = overlay.geometry().topLeft()
+            # 先钉到新屏光标下再挪窗。窗先过去时，旧局部坐标会画在新屏另一边，
+            # 拖动弹簧再把宠物拉回指针。
+            new_bounds = self._local_bounds(new_screen)
+            screen_origin = new_screen.geometry().topLeft()
+            local_x, local_y = local_point(
+                global_cursor.x(), global_cursor.y(),
+                screen_origin.x(), screen_origin.y())
+            self._snap_grab_under_cursor(grab, local_x, local_y, new_bounds)
+            repaint = getattr(overlay, "repaint", None)
+            if callable(repaint):
+                repaint()
+            self._disconnect_screen(old_screen)
+            self._screen = new_screen
+            overlay._screen = new_screen
+            # 合成窗必须整块等于目标屏，不能停在两屏之间。落点用目标屏原点，
+            # 不用 overlay.geometry()：setGeometry 没立刻生效时后者还是旧原点，
+            # 局部坐标会落到新边界外，宠物被钳在边缘卡住。
+            origin = self._fit_overlay_to_screen(overlay, new_screen)
+            for sprite in self._all_sprites():
+                if sprite is grab:
+                    continue
+                self._migrate_sprite_position(old_bounds, new_bounds, sprite)
+            self._apply_bounds(new_bounds)
+            try:
+                dpr = float(new_screen.devicePixelRatio())
+            except Exception:
+                dpr = 1.0
+            for sprite in self._all_sprites():
+                sprite.home_screen = new_screen
+                setter = getattr(sprite, "set_dpr", None)
+                if callable(setter):
+                    setter(dpr)
+            self._connect_screen(new_screen)
+            self._sync_bubble_origin(old_origin)
+            local_x, local_y = local_point(
+                global_cursor.x(), global_cursor.y(), origin.x(), origin.y())
+            if (local_x, local_y) != (
+                    global_cursor.x() - screen_origin.x(),
+                    global_cursor.y() - screen_origin.y()):
+                self._snap_grab_under_cursor(grab, local_x, local_y, new_bounds)
+            # 旧屏轨迹用的是旧原点。接上新屏坐标会被估成一次甩出，松手就弹射。
+            # 跨屏只留新位置这一个样本，之后在新屏上的快甩仍能重新攒速度。
+            if hasattr(grab, "_drag_trail"):
+                grab._drag_trail = []
+            move = getattr(grab, "on_move", None)
+            if callable(move):
+                move(QPointF(local_x, local_y))
+            refresher = getattr(overlay, "_refresh_tick_interval", None)
+            if callable(refresher):
+                refresher()
+            logging.info("overlay: 拖动跨屏 %s -> %s",
+                         _screen_name(old_screen), _screen_name(new_screen))
+            return True
+        except Exception:
+            logging.exception("overlay: 拖动跨屏失败")
+            if self._screen is new_screen:
+                self._connect_screen(new_screen)
+            else:
+                self._connect_screen(old_screen)
+            return False
+        finally:
+            self._cross_busy = False
 
     def _end_drag(self) -> None:
         """拖拽中拔屏/迁移：按当前位置松手收尾，清掉 overlay 的 grab 状态。"""

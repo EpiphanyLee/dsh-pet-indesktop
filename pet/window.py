@@ -2906,6 +2906,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
 
     def _enter_slingshot(self, global_pos: QPoint) -> None:
         self._flush_drag_move()  # 进入瞄准前应用最后一次跟手位置（锚点=当前窗口位置）
+        global_pos = self._hold_slingshot_cursor(global_pos)
         self._interaction_state = "SLINGSHOT_AIMING"
         self._slingshot_anchor_pos = QPoint(self._virtual_pos())  # 虚拟坐标：发射/回锚与物理同一坐标系
         self._slingshot_anchor_mouse = QPoint(global_pos)
@@ -2917,9 +2918,23 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         self.update()
 
+    def _hold_slingshot_cursor(self, global_pos: QPoint) -> QPoint:
+        """弹射拉动：系统光标不许离开宠物当前所在的这块屏。"""
+        from .window_screen_cross import hold_cursor_on_screen
+
+        screen = self._screen_available()
+        if screen is None:
+            return QPoint(global_pos)
+        try:
+            geometry = screen.geometry()
+        except Exception:
+            return QPoint(global_pos)
+        return hold_cursor_on_screen(global_pos, geometry)
+
     def _update_slingshot_aim(self, global_pos: QPoint) -> None:
         if self._slingshot_anchor_mouse is None:
             return
+        global_pos = self._hold_slingshot_cursor(global_pos)
         pull = self._slingshot_anchor_mouse - global_pos
         max_distance = physics_mod.SLINGSHOT_MAX_DISTANCE * self.scale
         length = math.hypot(pull.x(), pull.y())
